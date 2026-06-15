@@ -126,22 +126,151 @@ def collect_files(root, max_files, max_bytes=200_000):
     return out
 
 
-def scan_source(files):
+SECRET_FIX = "remove the secret, rotate it, and load from env/secret manager"
+
+
+def scan_source_patterns(files):
     findings = []
     for rel, content, lang in files:
-        lines = content.splitlines()
-        for i, line in enumerate(lines, 1):
+        for i, line in enumerate(content.splitlines(), 1):
             for rid, sev, cwe, langs, pat, title, fix in RULES:
                 if langs and lang not in langs:
                     continue
                 if re.search(pat, line):
                     findings.append({"kind": "source", "file": rel, "line": i, "severity": sev,
-                                     "cwe": cwe, "title": title, "detail": line.strip()[:120], "fix": fix})
+                                     "cwe": cwe, "title": title, "detail": line.strip()[:120],
+                                     "fix": fix, "_engine": "regex"})
+    return findings
+
+
+def scan_secret_patterns(files):
+    findings = []
+    for rel, content, lang in files:
+        for i, line in enumerate(content.splitlines(), 1):
             for rid, sev, pat, title in SECRET_RULES:
                 if re.search(pat, line):
                     findings.append({"kind": "secret", "file": rel, "line": i, "severity": sev,
-                                     "cwe": "CWE-798", "title": title, "detail": "(redacted match)", "fix": "remove the secret, rotate it, and load from env/secret manager"})
+                                     "cwe": "CWE-798", "title": title, "detail": "(redacted match)",
+                                     "fix": SECRET_FIX, "_engine": "regex"})
     return findings
+
+
+# ---------- external engines (use-if-present, graceful fallback) ----------
+
+SEMGREP_SEV = {"ERROR": "high", "WARNING": "medium", "INFO": "low"}
+TRIVY_SEV = {"CRITICAL": "critical", "HIGH": "high", "MEDIUM": "medium", "LOW": "low", "UNKNOWN": "low"}
+
+
+def have(tool):
+    return shutil.which(tool) is not None
+
+
+def _run(cmd, timeout=900):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout).stdout
+    except Exception:
+        return ""
+
+
+def run_semgrep(root):
+    """Source SAST via semgrep registry rules. Returns source findings, or None if semgrep absent/failed."""
+    if not have("semgrep"):
+        return None
+    # --config=auto pulls the registry ruleset (needs network; semgrep sends anonymous metrics for it).
+    # The offline path is the built-in regex ruleset (this returns None and main falls back).
+    out = _run(["semgrep", "--config=auto", "--json", "--quiet", "--timeout", "30", root])
+    try:
+        data = json.loads(out)
+    except Exception:
+        return None
+    findings = []
+    for r in data.get("results", []):
+        ex = r.get("extra", {}) or {}
+        meta = ex.get("metadata", {}) or {}
+        cwe_raw = meta.get("cwe", "")
+        if isinstance(cwe_raw, list):
+            cwe_raw = " ".join(cwe_raw)
+        m = re.search(r"CWE-\d+", str(cwe_raw))
+        try:
+            rel = os.path.relpath(r.get("path", ""), root)
+        except Exception:
+            rel = r.get("path", "")
+        msg = (ex.get("message", "") or "").strip().split("\n")[0]
+        findings.append({"kind": "source", "file": rel, "line": r.get("start", {}).get("line"),
+                         "severity": SEMGREP_SEV.get(ex.get("severity", "WARNING"), "medium"),
+                         "cwe": m.group(0) if m else "", "title": (msg or r.get("check_id", ""))[:90],
+                         "detail": "semgrep: " + r.get("check_id", "").split(".")[-1],
+                         "fix": (meta.get("references") or ["see the semgrep rule guidance"])[0],
+                         "_engine": "semgrep"})
+    return findings
+
+
+def run_trivy(root):
+    """IaC/config misconfig + secret breadth via trivy. Returns (config, secret) lists, or None if absent."""
+    if not have("trivy"):
+        return None
+    out = _run(["trivy", "fs", "--quiet", "--format", "json", "--scanners", "config,secret", root])
+    try:
+        data = json.loads(out)
+    except Exception:
+        return None
+    config, secrets = [], []
+    for res in (data.get("Results") or []):
+        tgt = res.get("Target", "")
+        for mc in (res.get("Misconfigurations") or []):
+            cm = mc.get("CauseMetadata", {}) or {}
+            config.append({"kind": "config", "file": tgt, "line": cm.get("StartLine"),
+                           "severity": TRIVY_SEV.get(mc.get("Severity", "LOW"), "low"),
+                           "cwe": mc.get("ID", ""), "title": (mc.get("Title") or mc.get("ID", ""))[:90],
+                           "detail": ("trivy: " + (mc.get("Message") or mc.get("Description") or ""))[:170],
+                           "fix": (mc.get("Resolution") or "see the trivy misconfig guidance")[:170],
+                           "_engine": "trivy"})
+        for s in (res.get("Secrets") or []):
+            secrets.append({"kind": "secret", "file": tgt, "line": s.get("StartLine"),
+                            "severity": TRIVY_SEV.get(s.get("Severity", "HIGH"), "high"),
+                            "cwe": "CWE-798", "title": (s.get("Title") or s.get("RuleID") or "secret")[:90],
+                            "detail": "(redacted match) trivy: " + s.get("RuleID", ""),
+                            "fix": SECRET_FIX, "_engine": "trivy"})
+    return config, secrets
+
+
+def run_trufflehog(root):
+    """Verified-secret detection via trufflehog. Returns secret findings, or None if absent."""
+    if not have("trufflehog"):
+        return None
+    out = _run(["trufflehog", "filesystem", root, "--results=verified,unknown", "--json", "--no-update"])
+    findings = []
+    for ln in out.splitlines():
+        ln = ln.strip()
+        if not ln.startswith("{"):
+            continue
+        try:
+            d = json.loads(ln)
+        except Exception:
+            continue
+        meta = (((d.get("SourceMetadata") or {}).get("Data") or {}).get("Filesystem") or {})
+        rel = meta.get("file", "")
+        try:
+            rel = os.path.relpath(rel, root) if rel else ""
+        except Exception:
+            pass
+        verified = bool(d.get("Verified"))
+        findings.append({"kind": "secret", "file": rel, "line": meta.get("line"),
+                         "severity": "high" if verified else "medium", "cwe": "CWE-798",
+                         "title": d.get("DetectorName", "secret") + (" (verified)" if verified else ""),
+                         "detail": "(redacted match) trufflehog", "fix": SECRET_FIX, "_engine": "trufflehog"})
+    return findings
+
+
+def dedup_secrets(secrets):
+    """Collapse secret findings from regex + trivy + trufflehog by (file, line), keeping the strongest."""
+    best = {}
+    for f in secrets:
+        key = (f["file"], f.get("line"))
+        cur = best.get(key)
+        if cur is None or SEV_RANK.get(f["severity"], 2) > SEV_RANK.get(cur["severity"], 2):
+            best[key] = f
+    return list(best.values())
 
 
 # ---------- dependencies + exploit intelligence (the differentiator) ----------
@@ -356,7 +485,8 @@ def report_terminal(root, findings, pts, letter):
     print(f"\n{C['b']}codecard: {root}{C['r']}")
     print(f"{C['b']}grade: {letter}   ({len(findings)} findings, {pts} risk points){C['r']}\n")
     for sec, kind in (("Dependencies (exploit-prioritized)", "dependency"), ("Source", "source"),
-                      ("Secrets", "secret"), ("AI (logic/authz, verify)", "ai")):
+                      ("Config / IaC", "config"), ("Secrets", "secret"),
+                      ("AI (logic/authz, verify)", "ai")):
         fs = [f for f in findings if f["kind"] == kind]
         if not fs:
             continue
@@ -390,6 +520,8 @@ def main():
     ap.add_argument("--max-files", type=int, default=400)
     ap.add_argument("--md", metavar="FILE")
     ap.add_argument("--no-deps", action="store_true", help="skip the dependency/exploit-intel scan")
+    ap.add_argument("--no-engines", action="store_true",
+                    help="skip external engines (semgrep/trivy/trufflehog); use built-in regex rules only")
     ap.add_argument("--ai", action="store_true", help="OPTIONAL: add an LLM pass for logic/authz bugs")
     ap.add_argument("--ai-backend", choices=["claude", "ollama", "openai"], default="claude")
     ap.add_argument("--ai-model")
@@ -400,7 +532,41 @@ def main():
 
     files = collect_files(args.path, args.max_files)
     print(f"scanning {len(files)} source files ...", file=sys.stderr)
-    findings = scan_source(files)
+
+    engines = []          # human-readable list of what actually ran
+    findings = []
+    secrets = []
+
+    # SOURCE: prefer semgrep (registry rules); fall back to the built-in regex ruleset.
+    src = None if args.no_engines else run_semgrep(args.path)
+    if src is not None:
+        engines.append(f"semgrep ({len(src)} source)")
+        findings += src
+    else:
+        findings += scan_source_patterns(files)
+        if args.no_engines:
+            engines.append("regex source rules")
+        elif have("semgrep"):
+            engines.append("regex source rules (semgrep present but returned nothing; needs network for --config=auto)")
+        else:
+            engines.append("regex source rules (semgrep not installed)")
+
+    # SECRETS: regex baseline always; add trivy + trufflehog when present, then dedup.
+    secrets += scan_secret_patterns(files)
+    if not args.no_engines:
+        tv = run_trivy(args.path)
+        if tv is not None:
+            cfg, tsec = tv
+            engines.append(f"trivy ({len(cfg)} config, {len(tsec)} secret)")
+            findings += cfg
+            secrets += tsec
+        th = run_trufflehog(args.path)
+        if th is not None:
+            engines.append(f"trufflehog ({len(th)} secret)")
+            secrets += th
+    findings += dedup_secrets(secrets)
+    print("engines: " + "; ".join(engines), file=sys.stderr)
+
     if not args.no_deps:
         print("checking dependencies against OSV + KEV + EPSS ...", file=sys.stderr)
         findings += scan_deps(args.path)

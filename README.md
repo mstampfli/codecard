@@ -10,16 +10,29 @@ python3 codecard.py ./myproject --ai --ai-backend ollama --ai-model qwen2.5:3b  
 ```
 
 ## What the core scans (no AI)
-- **Source patterns** - a curated ruleset per language: command/code injection, SQL
-  injection, insecure deserialization (pickle / `yaml.load`), weak crypto, TLS
-  verification disabled, debug-on, unbounded C buffer ops, and more.
-- **Secrets** - AWS keys, GitHub/Slack tokens, private keys, and hardcoded credentials.
-- **Dependencies, prioritized by real exploit intelligence** - the differentiator. OSV
-  finds vulnerable dependencies (requirements.txt / package-lock.json / Cargo.lock), then
-  every finding is ranked by **CISA KEV** (actively exploited in the wild) and **FIRST
+- **Source** - if `semgrep` is installed it drives the source pass (the full registry
+  ruleset); otherwise a built-in per-language regex ruleset runs (command/code injection,
+  SQL injection, insecure deserialization, weak crypto, TLS-off, debug-on, unbounded C
+  buffer ops, ...). The regex set is the fully-offline path.
+- **Config / IaC** - if `trivy` is installed, Dockerfiles / Kubernetes / Terraform are
+  scanned for misconfigurations (running as root, `:latest`, missing healthcheck, ...). No
+  built-in equivalent; this section is empty without trivy.
+- **Secrets** - a built-in detector (AWS keys, GitHub/Slack tokens, private keys,
+  hardcoded credentials) always runs, and `trivy` + `trufflehog` are layered on when
+  present for breadth and verified-secret confirmation. Results are de-duplicated by
+  file:line.
+- **Dependencies, prioritized by real exploit intelligence** - the differentiator, always
+  on. OSV finds vulnerable dependencies (requirements.txt / package-lock.json / Cargo.lock),
+  then every finding is ranked by **CISA KEV** (actively exploited in the wild) and **FIRST
   EPSS** (exploitation probability). Standard SCA tells you "a CVE exists"; codecard tells
   you *which* ones are being exploited so you fix those first. An actively-exploited
-  dependency caps the grade.
+  dependency caps the grade. (codecard keeps this rather than trivy's dep scan because the
+  KEV/EPSS prioritization is the point.)
+
+External engines are **use-if-present**: codecard orchestrates the mature scanners when
+they are on PATH and falls back to the built-in rules when they are not, then unifies and
+grades everything together. The startup `engines:` line reports exactly what ran. Use
+`--no-engines` to force the built-in rules only (fully offline together with `--no-deps`).
 
 Everything rolls up into an A-F grade with the exact fix per finding (terminal or `--md`).
 
@@ -38,17 +51,25 @@ AI findings are confidence-filtered and labeled **[AI, verify]** - LLMs hallucin
 they are leads to confirm, not verdicts.
 
 ## Honest scope
-- **Complements, not replaces** Semgrep/CodeQL. The source ruleset is a curated starter
-  set (easily extended); the headline value is the unified report + exploit-intel deps.
-- **Source-focused.** Deep compiled-binary analysis is a different, much harder domain and
-  is out of scope; shallow binary checks (checksec, secrets-in-strings) may come later.
+- **Orchestrates, doesn't reinvent.** When semgrep/trivy/trufflehog are present codecard
+  uses them; the headline value is the *unified, graded report* plus the exploit-intel dep
+  ranking that none of those tools do on their own. The built-in regex rules are a capable
+  offline fallback, not a semgrep replacement.
+- **Source + config + deps.** Deep compiled-binary analysis is a different, much harder
+  domain and is out of scope; shallow binary checks (checksec, secrets-in-strings) may come
+  later.
 - AI mode quality depends on the backend/model.
 
 ## Requirements
-Python 3 (stdlib only). Network for the OSV/KEV/EPSS dependency intelligence (cached). The
-`claude` CLI / Ollama / an API key are only needed for the optional `--ai` mode.
+Python 3 (stdlib only). Network for the OSV/KEV/EPSS dependency intelligence (cached).
+Optional external engines, used automatically when on PATH:
+- **semgrep** - deeper source SAST (the registry ruleset; needs network for `--config=auto`).
+- **trivy** - IaC/config misconfig + secret breadth.
+- **trufflehog** - verified-secret confirmation.
+
+The `claude` CLI / Ollama / an API key are only needed for the optional `--ai` mode.
 
 ## Roadmap
-- orchestrate external scanners (semgrep, gitleaks) when present, and AI-triage their output
 - derive dep severity from the CVSS vector; group findings per dependency
 - Metasploit / Exploit-DB signals on dependency findings (as in cve2detect)
+- de-duplicate the few cases where semgrep and trivy flag the same Dockerfile line
