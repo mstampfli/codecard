@@ -251,26 +251,43 @@ AI_DEFAULTS = {"claude": (None, None), "ollama": ("llama3.1", "http://localhost:
                "openai": ("gpt-4o-mini", "https://api.openai.com/v1")}
 
 
-def ai_generate(prompt, backend, model, url):
+AI_SYSTEM = (
+    "You are a senior application security auditor reviewing automated scanner output. For each file you "
+    "receive the source code and the deterministic findings the scanners already reported (each with an id). "
+    "Do two things: (1) TRIAGE every reported finding as true_positive, false_positive, or uncertain, with a "
+    "one-line reason grounded in the code context (this is the most valuable part: kill false positives); "
+    "(2) report additional REAL vulnerabilities the pattern scanners MISSED, especially broken authorization "
+    "(IDOR / missing checks), auth bypass, business-logic flaws, and cross-function taint. Be precise; never "
+    "invent issues. Output ONLY JSON, no prose: "
+    '{"triage":[{"id":<int>,"verdict":"true_positive|false_positive|uncertain","reason":"..."}],'
+    '"missed":[{"line":<int|null>,"severity":"critical|high|medium|low","cwe":"CWE-..","title":"..",'
+    '"detail":"..","fix":"..","confidence":0.0-1.0}]}'
+)
+
+
+def ai_generate(system, user, backend, model, url):
     if backend == "claude":
         if not shutil.which("claude"):
             return None, "claude CLI not found"
         args = ["claude", "-p", "--output-format", "text"] + (["--model", model] if model else [])
+        if system:
+            args += ["--append-system-prompt", system]
         try:
-            r = subprocess.run(args, input=prompt, capture_output=True, text=True, timeout=300)
+            r = subprocess.run(args, input=user, capture_output=True, text=True, timeout=300)
             return (r.stdout, None) if r.returncode == 0 and r.stdout.strip() else (None, r.stderr[:100] or "no output")
         except Exception as e:
             return None, str(e)
+    msgs = ([{"role": "system", "content": system}] if system else []) + [{"role": "user", "content": user}]
     if backend == "ollama":
-        d = post_json(f"{url}/api/generate", {"model": model, "prompt": prompt, "stream": False}, timeout=600)
-        return (d.get("response"), None) if d else (None, f"ollama unreachable at {url} / model '{model}'")
+        d = post_json(f"{url}/api/chat", {"model": model, "messages": msgs, "stream": False}, timeout=600)
+        return ((d.get("message", {}) or {}).get("content"), None) if d else (None, f"ollama unreachable at {url} / model '{model}'")
     if backend == "openai":
         key = os.environ.get("OPENAI_API_KEY") or os.environ.get("AI_API_KEY")
         if not key:
             return None, "set OPENAI_API_KEY for the openai backend"
         try:
             req = urllib.request.Request(f"{url}/chat/completions",
-                data=json.dumps({"model": model, "messages": [{"role": "user", "content": prompt}]}).encode(),
+                data=json.dumps({"model": model, "messages": msgs}).encode(),
                 headers={"Content-Type": "application/json", "Authorization": f"Bearer {key}"})
             with urllib.request.urlopen(req, timeout=600) as r:
                 return json.load(r)["choices"][0]["message"]["content"], None
@@ -279,34 +296,44 @@ def ai_generate(prompt, backend, model, url):
     return None, "unknown backend"
 
 
-def ai_audit(files, backend, model, url):
+def ai_review(files, det_findings, backend, model, url):
+    """AI mode: triage the deterministic findings (with code context) + report what scanners missed.
+    Mutates det_findings (adds ai_verdict/ai_reason) and returns new AI-only findings."""
     model = model or AI_DEFAULTS[backend][0]
     url = url or AI_DEFAULTS[backend][1]
-    findings = []
+    by_file = {}
+    for f in det_findings:
+        if f["kind"] in ("source", "secret"):
+            by_file.setdefault(f["file"], []).append(f)
+    new = []
     for rel, content, lang in files:
-        prompt = ("You are an application security auditor. Find security vulnerabilities in this file, "
-                  "especially the kinds pattern scanners miss: broken authorization (IDOR/missing checks), "
-                  "auth bypass, business-logic flaws, and cross-function taint. Return ONLY a JSON array; each "
-                  "item: {\"line\": int|null, \"severity\": \"critical|high|medium|low\", \"cwe\": \"CWE-..\", "
-                  "\"title\": \"..\", \"detail\": \"..\", \"fix\": \"..\", \"confidence\": 0.0-1.0}. "
-                  "Return [] if none. Be precise; do not invent.\n\nFILE: " + rel + "\n```\n" + content[:12000] + "\n```")
-        text, err = ai_generate(prompt, backend, model, url)
+        local = by_file.get(rel, [])
+        listing = "\n".join(f"  id {i}: [{f['severity']}] {f['title']} (line {f['line']}): {f['detail']}"
+                            for i, f in enumerate(local)) or "  (none reported)"
+        user = f"FILE: {rel}\n\nDETERMINISTIC FINDINGS:\n{listing}\n\nSOURCE:\n```\n{content[:12000]}\n```"
+        text, err = ai_generate(AI_SYSTEM, user, backend, model, url)
         if not text:
             print(f"  --ai: {rel}: skipped ({err})")
             continue
-        m = re.search(r"\[.*\]", text, re.S)
+        m = re.search(r"\{.*\}", text, re.S)
         if not m:
             continue
         try:
-            for it in json.loads(m.group(0)):
-                if it.get("confidence", 1) >= 0.5:
-                    findings.append({"kind": "ai", "file": rel, "line": it.get("line"),
-                                     "severity": (it.get("severity") or "medium").lower(), "cwe": it.get("cwe", ""),
-                                     "title": it.get("title", "AI finding"), "detail": (it.get("detail", "") + " [AI, verify]")[:160],
-                                     "fix": it.get("fix", "")})
+            data = json.loads(m.group(0))
         except Exception:
-            pass
-    return findings
+            continue
+        for t in data.get("triage", []):
+            i = t.get("id")
+            if isinstance(i, int) and 0 <= i < len(local):
+                local[i]["ai_verdict"] = t.get("verdict", "")
+                local[i]["ai_reason"] = (t.get("reason", "") or "")[:120]
+        for it in data.get("missed", []):
+            if it.get("confidence", 1) >= 0.5:
+                new.append({"kind": "ai", "file": rel, "line": it.get("line"),
+                            "severity": (it.get("severity") or "medium").lower(), "cwe": it.get("cwe", ""),
+                            "title": it.get("title", "AI finding"),
+                            "detail": (it.get("detail", "") + " [AI, verify]")[:180], "fix": it.get("fix", "")})
+    return new
 
 
 # ---------- grade + report ----------
@@ -339,6 +366,8 @@ def report_terminal(root, findings, pts, letter):
             loc = f["file"] + (f":{f['line']}" if f["line"] else "")
             print(f"  {col}[{f['severity']:>8}]{C['r']} {f['title']}  {C['low']}{loc}{C['r']}")
             print(f"            {f['detail']}")
+            if f.get("ai_verdict"):
+                print(f"            {C['low']}AI triage: {f['ai_verdict']} - {f.get('ai_reason', '')}{C['r']}")
             if f.get("fix"):
                 print(f"            {C['low']}fix: {f['fix']}{C['r']}")
         print()
@@ -376,8 +405,8 @@ def main():
         print("checking dependencies against OSV + KEV + EPSS ...", file=sys.stderr)
         findings += scan_deps(args.path)
     if args.ai:
-        print(f"--ai: auditing with {args.ai_backend} (logic/authz pass) ...", file=sys.stderr)
-        findings += ai_audit(files, args.ai_backend, args.ai_model, args.ai_url)
+        print(f"--ai: triaging findings + logic/authz pass with {args.ai_backend} ...", file=sys.stderr)
+        findings += ai_review(files, findings, args.ai_backend, args.ai_model, args.ai_url)
 
     pts, letter = grade(findings)
     report_terminal(args.path, findings, pts, letter)

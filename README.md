@@ -24,9 +24,12 @@ python3 codecard.py ./myproject --ai --ai-backend ollama --ai-model qwen2.5:3b  
 Everything rolls up into an A-F grade with the exact fix per finding (terminal or `--md`).
 
 ## The optional `--ai` mode
-`--ai` layers an LLM pass on top to catch what pattern scanners structurally miss -
-broken authorization (IDOR), auth bypass, business-logic flaws, cross-function taint - and
-to add context. It is **off by default**; the tool is fully useful without it. Backends:
+`--ai` adds an LLM pass that, given the deterministic findings + a system prompt as
+context, does two things: (1) **triages every deterministic finding** as true_positive /
+false_positive / uncertain with a one-line reason from the code (the big win - kills false
+positives), and (2) reports vulnerabilities the pattern scanners structurally miss (broken
+authorization / IDOR, auth bypass, business-logic flaws, cross-function taint).
+It is **off by default**; the tool is fully useful without it. Backends:
 - **claude** (default) - the Claude Code CLI, no key.
 - **ollama** - a local model, no key, fully offline (so you can audit proprietary code).
 - **openai** - any OpenAI-compatible API (`--ai-url` + `OPENAI_API_KEY`).
