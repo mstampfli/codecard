@@ -10,6 +10,7 @@ python3 codecard.py --setup                       # one-time: download the scann
 python3 codecard.py ./myproject                   # scan a whole repo / deployment
 python3 codecard.py ./myproject --image myapp:1.2 # ... and its built container image
 python3 codecard.py ./myproject --md report.md
+python3 codecard.py ./myproject --json            # full report as JSON (CI / tooling)
 python3 codecard.py ./myproject --ai --ai-backend ollama --ai-model qwen2.5:3b   # optional AI pass
 ```
 

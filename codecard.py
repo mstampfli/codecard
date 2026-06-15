@@ -738,6 +738,7 @@ def main():
     ap.add_argument("--setup", action="store_true", help="download the external engines into the cache, then exit")
     ap.add_argument("--max-files", type=int, default=400)
     ap.add_argument("--md", metavar="FILE")
+    ap.add_argument("--json", action="store_true", help="emit the full report as JSON (for CI / tooling)")
     ap.add_argument("--no-deps", action="store_true", help="skip the dependency/exploit-intel scan")
     ap.add_argument("--no-engines", action="store_true",
                     help="skip external engines (semgrep/trivy/trufflehog/gitleaks/hadolint); built-in rules only")
@@ -830,7 +831,13 @@ def main():
 
     target = args.path or args.image
     pts, letter = grade(findings)
-    report_terminal(target, findings, pts, letter)
+    if args.json:
+        order = {"critical": 0, "high": 1, "medium": 2, "low": 3, "unknown": 2}
+        ordered = sorted(findings, key=lambda f: (order.get(f["severity"], 2), -f.get("_epss", 0)))
+        print(json.dumps({"target": target, "grade": letter, "points": pts,
+                          "findings": ordered}, indent=2))
+    else:
+        report_terminal(target, findings, pts, letter)
     if args.md:
         report_md(target, findings, pts, letter, args.md)
 
