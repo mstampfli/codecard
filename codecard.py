@@ -18,18 +18,29 @@ on top, via a pluggable backend (claude CLI / local Ollama / OpenAI-compatible A
 """
 
 import argparse
+import io
 import json
 import os
+import platform
 import re
 import shutil
+import stat
 import subprocess
 import sys
+import tarfile
 import time
 import urllib.request
 
 UA = {"User-Agent": "codecard/0.1"}
 CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "codecard")
+ENGINE_BIN = os.path.join(CACHE_DIR, "bin")  # where --setup installs engines
 SEV_RANK = {"critical": 4, "high": 3, "medium": 2, "low": 1, "unknown": 2}
+
+
+def ensure_engine_path():
+    """Put codecard's downloaded engines on PATH so have()/subprocess find them."""
+    if os.path.isdir(ENGINE_BIN) and ENGINE_BIN not in os.environ.get("PATH", "").split(os.pathsep):
+        os.environ["PATH"] = ENGINE_BIN + os.pathsep + os.environ.get("PATH", "")
 
 LANG = {".py": "python", ".js": "js", ".jsx": "js", ".ts": "js", ".tsx": "js",
         ".rb": "ruby", ".php": "php", ".go": "go", ".java": "java", ".rs": "rust",
@@ -217,9 +228,24 @@ def run_trivy(root, scanners="vuln,config,secret"):
         return None
     out = _run(["trivy", "fs", "--quiet", "--format", "json", "--scanners", scanners, root])
     try:
-        data = json.loads(out)
+        return _parse_trivy(json.loads(out))
     except Exception:
         return None
+
+
+def run_trivy_image(image, scanners="vuln,secret"):
+    """Scan a built container image's OS packages + app deps + secrets (trivy image).
+    Returns (vulns, config, secrets), or None if trivy is absent/failed."""
+    if not have("trivy"):
+        return None
+    out = _run(["trivy", "image", "--quiet", "--format", "json", "--scanners", scanners, image])
+    try:
+        return _parse_trivy(json.loads(out))
+    except Exception:
+        return None
+
+
+def _parse_trivy(data):
     vulns, config, secrets = [], [], []
     for res in (data.get("Results") or []):
         tgt = res.get("Target", "")
@@ -300,8 +326,68 @@ def run_trufflehog(root):
     return findings
 
 
+def run_gitleaks(root):
+    """Secret detection via gitleaks (broad rule pack). Returns secret findings, or None if absent."""
+    if not have("gitleaks"):
+        return None
+    out = _run(["gitleaks", "detect", "--source", root, "--no-git", "--no-banner",
+                "-f", "json", "-r", "/dev/stdout", "--exit-code", "0"])
+    try:
+        items = json.loads(out or "[]")
+    except Exception:
+        return None
+    findings = []
+    for it in items:
+        rel = it.get("File", "")
+        try:
+            rel = os.path.relpath(rel, root) if rel else ""
+        except Exception:
+            pass
+        findings.append({"kind": "secret", "file": rel, "line": it.get("StartLine"),
+                         "severity": "high", "cwe": "CWE-798",
+                         "title": (it.get("RuleID") or it.get("Description") or "secret")[:90],
+                         "detail": "(redacted match) gitleaks", "fix": SECRET_FIX, "_engine": "gitleaks"})
+    return findings
+
+
+HADOLINT_SEV = {"error": "high", "warning": "medium", "info": "low", "style": "low"}
+
+
+def run_hadolint(root):
+    """Dockerfile linting via hadolint (shell-level issues trivy's config scan misses).
+    Returns config findings, or None if hadolint is absent / no Dockerfiles found."""
+    if not have("hadolint"):
+        return None
+    dockerfiles = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS and not d.startswith(".")]
+        for fn in filenames:
+            if fn == "Dockerfile" or fn.startswith("Dockerfile.") or fn.endswith(".dockerfile"):
+                dockerfiles.append(os.path.join(dirpath, fn))
+    if not dockerfiles:
+        return None
+    out = _run(["hadolint", "--no-fail", "-f", "json"] + dockerfiles)
+    try:
+        items = json.loads(out or "[]")
+    except Exception:
+        return None
+    findings = []
+    for it in items:
+        rel = it.get("file", "")
+        try:
+            rel = os.path.relpath(rel, root) if rel else ""
+        except Exception:
+            pass
+        findings.append({"kind": "config", "file": rel, "line": it.get("line"),
+                         "severity": HADOLINT_SEV.get(it.get("level", "info"), "low"),
+                         "cwe": it.get("code", ""), "title": (it.get("message") or it.get("code", ""))[:90],
+                         "detail": "hadolint: " + it.get("code", ""),
+                         "fix": "see hadolint wiki for " + it.get("code", ""), "_engine": "hadolint"})
+    return findings
+
+
 def dedup_secrets(secrets):
-    """Collapse secret findings from regex + trivy + trufflehog by (file, line), keeping the strongest."""
+    """Collapse secret findings from regex + trivy + trufflehog + gitleaks by (file, line), keep the strongest."""
     best = {}
     for f in secrets:
         key = (f["file"], f.get("line"))
@@ -309,6 +395,97 @@ def dedup_secrets(secrets):
         if cur is None or SEV_RANK.get(f["severity"], 2) > SEV_RANK.get(cur["severity"], 2):
             best[key] = f
     return list(best.values())
+
+
+# ---------- engine auto-install (--setup): official release binaries into ENGINE_BIN ----------
+
+def _arch():
+    return "arm64" if platform.machine().lower() in ("arm64", "aarch64") else "amd64"
+
+
+def _dl(url, timeout=240):
+    with urllib.request.urlopen(urllib.request.Request(url, headers=UA), timeout=timeout) as r:
+        return r.read()
+
+
+def _gh_tag(repo):
+    return ((get_json(f"https://api.github.com/repos/{repo}/releases/latest") or {}).get("tag_name") or "")
+
+
+def _write_exec(path, data):
+    with open(path, "wb") as f:
+        f.write(data)
+    os.chmod(path, os.stat(path).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+
+
+def _extract_targz(data, basename, dest):
+    with tarfile.open(fileobj=io.BytesIO(data)) as tf:
+        for m in tf.getmembers():
+            if m.isfile() and os.path.basename(m.name) == basename:
+                _write_exec(dest, tf.extractfile(m).read())
+                return True
+    raise RuntimeError(f"{basename} not found in archive")
+
+
+def _install_hadolint(bindir):
+    arch = "x86_64" if _arch() == "amd64" else "arm64"
+    url = f"https://github.com/hadolint/hadolint/releases/latest/download/hadolint-Linux-{arch}"
+    _write_exec(os.path.join(bindir, "hadolint"), _dl(url))
+    return url
+
+
+def _install_gitleaks(bindir):
+    tag = _gh_tag("gitleaks/gitleaks"); ver = tag.lstrip("v")
+    arch = "x64" if _arch() == "amd64" else "arm64"
+    url = f"https://github.com/gitleaks/gitleaks/releases/download/{tag}/gitleaks_{ver}_linux_{arch}.tar.gz"
+    _extract_targz(_dl(url), "gitleaks", os.path.join(bindir, "gitleaks"))
+    return url
+
+
+def _install_trivy(bindir):
+    tag = _gh_tag("aquasecurity/trivy"); ver = tag.lstrip("v")
+    arch = "64bit" if _arch() == "amd64" else "ARM64"
+    url = f"https://github.com/aquasecurity/trivy/releases/download/{tag}/trivy_{ver}_Linux-{arch}.tar.gz"
+    _extract_targz(_dl(url), "trivy", os.path.join(bindir, "trivy"))
+    return url
+
+
+def _install_trufflehog(bindir):
+    tag = _gh_tag("trufflesecurity/trufflehog"); ver = tag.lstrip("v")
+    arch = "amd64" if _arch() == "amd64" else "arm64"
+    url = f"https://github.com/trufflesecurity/trufflehog/releases/download/{tag}/trufflehog_{ver}_linux_{arch}.tar.gz"
+    _extract_targz(_dl(url), "trufflehog", os.path.join(bindir, "trufflehog"))
+    return url
+
+
+def _install_semgrep(bindir):
+    subprocess.run([sys.executable, "-m", "pip", "install", "--user", "--quiet", "--upgrade", "semgrep"],
+                   timeout=900, check=True)
+    return "pip install --user semgrep"
+
+
+INSTALLERS = {"trivy": _install_trivy, "semgrep": _install_semgrep, "trufflehog": _install_trufflehog,
+              "gitleaks": _install_gitleaks, "hadolint": _install_hadolint}
+
+
+def setup_engines():
+    """Download every engine codecard uses from its official source into ENGINE_BIN (semgrep via pip)."""
+    os.makedirs(ENGINE_BIN, exist_ok=True)
+    ensure_engine_path()
+    print(f"codecard --setup: installing engines into {ENGINE_BIN}\n")
+    for name, fn in INSTALLERS.items():
+        if have(name):
+            print(f"  {name:<11} present  ({shutil.which(name)})")
+            continue
+        print(f"  {name:<11} downloading ...", flush=True)
+        try:
+            src = fn(ENGINE_BIN)
+            ok = have(name)
+            print(f"  {name:<11} {'installed' if ok else 'FAILED (not on PATH)'}  <- {src}")
+        except Exception as e:
+            print(f"  {name:<11} FAILED  ({e})")
+    print(f"\ndone. add this to your shell to use them everywhere:  export PATH=\"{ENGINE_BIN}:$PATH\"")
+    print("(codecard itself already finds them on its own.)")
 
 
 # ---------- dependencies + exploit intelligence (the differentiator) ----------
@@ -556,77 +733,106 @@ def report_md(root, findings, pts, letter, path):
 
 def main():
     ap = argparse.ArgumentParser(description="security report card for a codebase")
-    ap.add_argument("path")
+    ap.add_argument("path", nargs="?", help="source tree to scan (a whole repo / deployment)")
+    ap.add_argument("--image", metavar="TAG", help="also scan a built container image's OS + app packages (trivy image)")
+    ap.add_argument("--setup", action="store_true", help="download the external engines into the cache, then exit")
     ap.add_argument("--max-files", type=int, default=400)
     ap.add_argument("--md", metavar="FILE")
     ap.add_argument("--no-deps", action="store_true", help="skip the dependency/exploit-intel scan")
     ap.add_argument("--no-engines", action="store_true",
-                    help="skip external engines (semgrep/trivy/trufflehog); use built-in regex rules only")
+                    help="skip external engines (semgrep/trivy/trufflehog/gitleaks/hadolint); built-in rules only")
     ap.add_argument("--ai", action="store_true", help="OPTIONAL: add an LLM pass for logic/authz bugs")
     ap.add_argument("--ai-backend", choices=["claude", "ollama", "openai"], default="claude")
     ap.add_argument("--ai-model")
     ap.add_argument("--ai-url")
     args = ap.parse_args()
-    if not os.path.isdir(args.path):
-        sys.exit(f"error: {args.path} is not a directory")
 
-    files = collect_files(args.path, args.max_files)
-    print(f"scanning {len(files)} source files ...", file=sys.stderr)
+    ensure_engine_path()
+    if args.setup:
+        setup_engines()
+        return
+    if not args.path and not args.image:
+        ap.error("give a PATH to scan, or --image TAG, or --setup")
+    if args.path and not os.path.isdir(args.path):
+        sys.exit(f"error: {args.path} is not a directory")
 
     engines = []          # human-readable list of what actually ran
     findings = []
     secrets = []
+    dep_vulns = []        # trivy vulns (fs + image), enriched once with KEV/EPSS
+    files = []
+    use_engines = not args.no_engines
 
-    # One trivy pass feeds three sections: dep vulns (broad ecosystem coverage), config/IaC, secrets.
-    scanners = ("config,secret" if args.no_deps else "vuln,config,secret")
-    trivy_res = None if args.no_engines else run_trivy(args.path, scanners)
+    if args.path:
+        files = collect_files(args.path, args.max_files)
+        print(f"scanning {len(files)} source files in {args.path} ...", file=sys.stderr)
 
-    # SOURCE: prefer semgrep (registry rules); fall back to the built-in regex ruleset.
-    src = None if args.no_engines else run_semgrep(args.path)
-    if src is not None:
-        engines.append(f"semgrep ({len(src)} source)")
-        findings += src
-    else:
-        findings += scan_source_patterns(files)
-        if args.no_engines:
-            engines.append("regex source rules")
-        elif have("semgrep"):
-            engines.append("regex source rules (semgrep present but returned nothing; needs network for --config=auto)")
+        # One trivy fs pass feeds three sections: dep vulns (broad ecosystem coverage), config/IaC, secrets.
+        scanners = ("config,secret" if args.no_deps else "vuln,config,secret")
+        trivy_res = run_trivy(args.path, scanners) if use_engines else None
+
+        # SOURCE: prefer semgrep (registry rules); fall back to the built-in regex ruleset.
+        src = run_semgrep(args.path) if use_engines else None
+        if src is not None:
+            engines.append(f"semgrep ({len(src)} source)")
+            findings += src
         else:
-            engines.append("regex source rules (semgrep not installed)")
+            findings += scan_source_patterns(files)
+            if args.no_engines:
+                engines.append("regex source rules")
+            elif have("semgrep"):
+                engines.append("regex source rules (semgrep present but returned nothing; needs network for --config=auto)")
+            else:
+                engines.append("regex source rules (semgrep not installed; run --setup)")
 
-    # CONFIG/IaC + SECRETS: regex secret baseline always; add trivy + trufflehog when present, then dedup.
-    secrets += scan_secret_patterns(files)
-    if trivy_res is not None:
-        tvuln, tcfg, tsec = trivy_res
-        engines.append(f"trivy ({len(tvuln)} dep, {len(tcfg)} config, {len(tsec)} secret)")
-        findings += tcfg
-        secrets += tsec
-    if not args.no_engines:
-        th = run_trufflehog(args.path)
-        if th is not None:
-            engines.append(f"trufflehog ({len(th)} secret)")
-            secrets += th
-    findings += dedup_secrets(secrets)
-    print("engines: " + "; ".join(engines), file=sys.stderr)
-
-    # DEPENDENCIES: trivy's cross-ecosystem vulns when present (whole-setup coverage), else OSV
-    # over the three built-in lockfiles. Either way, prioritized by KEV + EPSS.
-    if not args.no_deps:
+        # CONFIG/IaC: trivy + hadolint (Dockerfile depth).   SECRETS: regex + trivy + trufflehog + gitleaks.
+        secrets += scan_secret_patterns(files)
         if trivy_res is not None:
-            print("prioritizing trivy's dependency CVEs by KEV + EPSS ...", file=sys.stderr)
-            findings += enrich_deps(trivy_res[0])
+            tvuln, tcfg, tsec = trivy_res
+            engines.append(f"trivy ({len(tvuln)} dep, {len(tcfg)} config, {len(tsec)} secret)")
+            findings += tcfg
+            secrets += tsec
+            dep_vulns += tvuln
+        if use_engines:
+            for runner, kind in ((run_hadolint, "config"), (run_trufflehog, "secret"), (run_gitleaks, "secret")):
+                res = runner(args.path)
+                if res is not None:
+                    engines.append(f"{runner.__name__[4:]} ({len(res)} {kind})")
+                    (findings if kind == "config" else secrets).extend(res)
+
+    # CONTAINER IMAGE: OS packages + app deps + layer secrets.
+    if args.image:
+        ti = run_trivy_image(args.image, "secret" if args.no_deps else "vuln,secret")
+        if ti is None:
+            print("--image needs trivy; run `codecard --setup`", file=sys.stderr)
         else:
+            ivuln, _icfg, isec = ti
+            engines.append(f"trivy image {args.image} ({len(ivuln)} vuln, {len(isec)} secret)")
+            secrets += isec
+            dep_vulns += ivuln
+
+    findings += dedup_secrets(secrets)
+    print("engines: " + ("; ".join(engines) or "built-in rules only"), file=sys.stderr)
+
+    # DEPENDENCIES: trivy's cross-ecosystem vulns (fs + image) when trivy is present (whole-setup
+    # coverage), else OSV over the built-in lockfiles. Either way, prioritized by KEV + EPSS.
+    if not args.no_deps:
+        if have("trivy"):
+            print("prioritizing dependency CVEs by KEV + EPSS ...", file=sys.stderr)
+            findings += enrich_deps(dep_vulns)
+        elif args.path:
             print("checking dependencies against OSV + KEV + EPSS ...", file=sys.stderr)
             findings += scan_deps_osv(args.path)
+
     if args.ai:
         print(f"--ai: triaging findings + logic/authz pass with {args.ai_backend} ...", file=sys.stderr)
         findings += ai_review(files, findings, args.ai_backend, args.ai_model, args.ai_url)
 
+    target = args.path or args.image
     pts, letter = grade(findings)
-    report_terminal(args.path, findings, pts, letter)
+    report_terminal(target, findings, pts, letter)
     if args.md:
-        report_md(args.path, findings, pts, letter, args.md)
+        report_md(target, findings, pts, letter, args.md)
 
 
 if __name__ == "__main__":

@@ -6,7 +6,9 @@ across source, config/IaC, secrets, and dependencies. It walks the entire tree, 
 single file. **Deterministic by default, no API keys.**
 
 ```sh
-python3 codecard.py ./myproject
+python3 codecard.py --setup                       # one-time: download the scanner engines
+python3 codecard.py ./myproject                   # scan a whole repo / deployment
+python3 codecard.py ./myproject --image myapp:1.2 # ... and its built container image
 python3 codecard.py ./myproject --md report.md
 python3 codecard.py ./myproject --ai --ai-backend ollama --ai-model qwen2.5:3b   # optional AI pass
 ```
@@ -16,13 +18,17 @@ python3 codecard.py ./myproject --ai --ai-backend ollama --ai-model qwen2.5:3b  
   ruleset); otherwise a built-in per-language regex ruleset runs (command/code injection,
   SQL injection, insecure deserialization, weak crypto, TLS-off, debug-on, unbounded C
   buffer ops, ...). The regex set is the fully-offline path.
-- **Config / IaC** - if `trivy` is installed, Dockerfiles / Kubernetes / Terraform are
-  scanned for misconfigurations (running as root, `:latest`, missing healthcheck, ...). No
-  built-in equivalent; this section is empty without trivy.
+- **Config / IaC** - `trivy` scans Dockerfiles / Kubernetes / Terraform / compose for
+  misconfigurations (running as root, `:latest`, privileged, missing healthcheck, ...), and
+  `hadolint` adds Dockerfile depth (shell-level issues, unpinned `apt` installs) that trivy
+  doesn't cover. No built-in equivalent; this section needs at least one of them.
 - **Secrets** - a built-in detector (AWS keys, GitHub/Slack tokens, private keys,
-  hardcoded credentials) always runs, and `trivy` + `trufflehog` are layered on when
-  present for breadth and verified-secret confirmation. Results are de-duplicated by
+  hardcoded credentials) always runs, and `trivy`, `trufflehog`, and `gitleaks` are layered
+  on when present for breadth and verified-secret confirmation. Results are de-duplicated by
   file:line.
+- **Container images** - `--image TAG` runs `trivy image` to scan a *built* image's OS
+  packages (apt/apk/...) and bundled app dependencies, folded into the same KEV/EPSS-ranked
+  dependency report. Catches what a source scan can't: the base image and everything baked in.
 - **Dependencies, prioritized by real exploit intelligence** - the differentiator, always
   on. When `trivy` is installed it finds vulnerable dependencies across **every ecosystem it
   parses** (pip, npm/yarn/pnpm, go, cargo, gem, composer, maven, nuget, ...), so a whole
@@ -68,10 +74,14 @@ they are leads to confirm, not verdicts.
 Python 3 (stdlib only). Network for the OSV/KEV/EPSS dependency intelligence (cached).
 Optional external engines, used automatically when on PATH:
 - **semgrep** - deeper source SAST (the registry ruleset; needs network for `--config=auto`).
-- **trivy** - IaC/config misconfig + secret breadth.
-- **trufflehog** - verified-secret confirmation.
+- **trivy** - cross-ecosystem dependency CVEs, IaC/config misconfig, secrets, image scanning.
+- **trufflehog** / **gitleaks** - secret detection breadth + verified-secret confirmation.
+- **hadolint** - Dockerfile linting depth.
 
-The `claude` CLI / Ollama / an API key are only needed for the optional `--ai` mode.
+`python3 codecard.py --setup` downloads all of these from their official releases into
+`~/.cache/codecard/bin` (semgrep via `pip --user`) and codecard finds them there
+automatically - no `sudo`, no manual install. The `claude` CLI / Ollama / an API key are
+only needed for the optional `--ai` mode.
 
 ## Roadmap
 - derive dep severity from the CVSS vector; group findings per dependency
