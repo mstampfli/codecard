@@ -205,18 +205,31 @@ def run_semgrep(root):
     return findings
 
 
-def run_trivy(root):
-    """IaC/config misconfig + secret breadth via trivy. Returns (config, secret) lists, or None if absent."""
+TRIVY_VSEV = {"CRITICAL": "critical", "HIGH": "high", "MEDIUM": "medium", "LOW": "low"}
+
+
+def run_trivy(root, scanners="vuln,config,secret"):
+    """Cross-ecosystem dep vulns + IaC/config misconfig + secret breadth via trivy.
+    Returns (vulns, config, secrets), or None if trivy is absent/failed. trivy parses every
+    lockfile/manifest it supports (pip, npm/yarn/pnpm, go, cargo, gem, composer, maven, nuget, ...),
+    so dependency coverage spans a whole repo, not just the three formats the built-in parser reads."""
     if not have("trivy"):
         return None
-    out = _run(["trivy", "fs", "--quiet", "--format", "json", "--scanners", "config,secret", root])
+    out = _run(["trivy", "fs", "--quiet", "--format", "json", "--scanners", scanners, root])
     try:
         data = json.loads(out)
     except Exception:
         return None
-    config, secrets = [], []
+    vulns, config, secrets = [], [], []
     for res in (data.get("Results") or []):
         tgt = res.get("Target", "")
+        eco = res.get("Type") or res.get("Class") or "dep"
+        for v in (res.get("Vulnerabilities") or []):
+            vulns.append({"cve": v.get("VulnerabilityID", ""),
+                          "severity": TRIVY_VSEV.get(v.get("Severity", ""), "unknown"),
+                          "title": (v.get("Title") or v.get("Description") or "")[:90],
+                          "loc": f"{eco}:{v.get('PkgName')}@{v.get('InstalledVersion')}",
+                          "fixed": v.get("FixedVersion", "")})
         for mc in (res.get("Misconfigurations") or []):
             cm = mc.get("CauseMetadata", {}) or {}
             config.append({"kind": "config", "file": tgt, "line": cm.get("StartLine"),
@@ -231,7 +244,32 @@ def run_trivy(root):
                             "cwe": "CWE-798", "title": (s.get("Title") or s.get("RuleID") or "secret")[:90],
                             "detail": "(redacted match) trivy: " + s.get("RuleID", ""),
                             "fix": SECRET_FIX, "_engine": "trivy"})
-    return config, secrets
+    return vulns, config, secrets
+
+
+def enrich_deps(tvulns):
+    """Prioritize trivy's cross-ecosystem dependency CVEs by CISA KEV + FIRST EPSS (the differentiator).
+    KEV (exploited in the wild) forces critical and caps the grade; EPSS adds exploitation probability."""
+    cves = {v["cve"] for v in tvulns if v["cve"].startswith("CVE-")}
+    kev = kev_set() if cves else {}
+    epss = epss_scores(cves) if cves else {}
+    out = []
+    for v in tvulns:
+        c = v["cve"]
+        in_kev = c in kev
+        ep = epss.get(c)
+        sev = "critical" if in_kev else v["severity"]
+        intel = []
+        if in_kev:
+            intel.append("KEV (actively exploited)")
+        if ep is not None:
+            intel.append(f"EPSS {ep*100:.0f}%")
+        out.append({"kind": "dependency", "file": v["loc"], "line": None, "severity": sev,
+                    "cwe": c, "title": v["title"] or c,
+                    "detail": "; ".join(intel) or "no exploit signal",
+                    "fix": (f"upgrade to {v['fixed']}" if v.get("fixed") else "upgrade past the vulnerable version"),
+                    "_kev": in_kev, "_epss": ep or 0.0})
+    return out
 
 
 def run_trufflehog(root):
@@ -325,7 +363,9 @@ def epss_scores(cves):
     return out
 
 
-def scan_deps(root):
+def scan_deps_osv(root):
+    """Fallback dependency scan when trivy is absent: OSV over the three lockfiles the built-in
+    parser reads (requirements.txt / package-lock.json / Cargo.lock), prioritized by KEV + EPSS."""
     deps = parse_manifests(root)
     if not deps:
         return []
@@ -537,6 +577,10 @@ def main():
     findings = []
     secrets = []
 
+    # One trivy pass feeds three sections: dep vulns (broad ecosystem coverage), config/IaC, secrets.
+    scanners = ("config,secret" if args.no_deps else "vuln,config,secret")
+    trivy_res = None if args.no_engines else run_trivy(args.path, scanners)
+
     # SOURCE: prefer semgrep (registry rules); fall back to the built-in regex ruleset.
     src = None if args.no_engines else run_semgrep(args.path)
     if src is not None:
@@ -551,15 +595,14 @@ def main():
         else:
             engines.append("regex source rules (semgrep not installed)")
 
-    # SECRETS: regex baseline always; add trivy + trufflehog when present, then dedup.
+    # CONFIG/IaC + SECRETS: regex secret baseline always; add trivy + trufflehog when present, then dedup.
     secrets += scan_secret_patterns(files)
+    if trivy_res is not None:
+        tvuln, tcfg, tsec = trivy_res
+        engines.append(f"trivy ({len(tvuln)} dep, {len(tcfg)} config, {len(tsec)} secret)")
+        findings += tcfg
+        secrets += tsec
     if not args.no_engines:
-        tv = run_trivy(args.path)
-        if tv is not None:
-            cfg, tsec = tv
-            engines.append(f"trivy ({len(cfg)} config, {len(tsec)} secret)")
-            findings += cfg
-            secrets += tsec
         th = run_trufflehog(args.path)
         if th is not None:
             engines.append(f"trufflehog ({len(th)} secret)")
@@ -567,9 +610,15 @@ def main():
     findings += dedup_secrets(secrets)
     print("engines: " + "; ".join(engines), file=sys.stderr)
 
+    # DEPENDENCIES: trivy's cross-ecosystem vulns when present (whole-setup coverage), else OSV
+    # over the three built-in lockfiles. Either way, prioritized by KEV + EPSS.
     if not args.no_deps:
-        print("checking dependencies against OSV + KEV + EPSS ...", file=sys.stderr)
-        findings += scan_deps(args.path)
+        if trivy_res is not None:
+            print("prioritizing trivy's dependency CVEs by KEV + EPSS ...", file=sys.stderr)
+            findings += enrich_deps(trivy_res[0])
+        else:
+            print("checking dependencies against OSV + KEV + EPSS ...", file=sys.stderr)
+            findings += scan_deps_osv(args.path)
     if args.ai:
         print(f"--ai: triaging findings + logic/authz pass with {args.ai_backend} ...", file=sys.stderr)
         findings += ai_review(files, findings, args.ai_backend, args.ai_model, args.ai_url)
